@@ -18,6 +18,7 @@ rich = "^13.9.4"
 nltk = "^3.9.1"
 rouge-score = "^0.1.2"
 pydantic = "^2.10.3"
+pytest = "^8.3.4"
 
 
 [build-system]
