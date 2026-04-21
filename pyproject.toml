@@ -100,3 +100,9 @@ ignore = [
 [tool.ruff.lint.pyupgrade]
 # Preserve types, even if a file imports `from __future__ import annotations`.
 keep-runtime-typing = true
+
+[tool.pytest.ini_options]
+markers = [
+    "network: requires internet access (e.g. HuggingFace model download)",
+]
+addopts = "-ra"

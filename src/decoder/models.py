@@ -65,12 +65,14 @@ def _top_k_top_p_filter(
         sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
         cum = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
         remove = cum > top_p
-        # Always keep the top token.
-        remove[..., 0] = False
-        # Shift right so we remove the token AFTER the threshold is crossed.
+        # Shift right so the token that CROSSES the threshold is still kept,
+        # then unconditionally keep the top token.
         remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
         sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
-        logits = torch.zeros_like(logits).scatter(-1, sorted_idx, sorted_logits)
+        logits = torch.full_like(logits, float("-inf")).scatter(
+            -1, sorted_idx, sorted_logits
+        )
     return logits
 
 

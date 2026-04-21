@@ -26,6 +26,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from src.common.config import LANGJEPAConfig
+from src.common.stats import spearman_rho
 from src.decoder.concept_extractor import ConceptExtractor
 from src.encoder.models import TextTransformer
 
@@ -68,20 +69,6 @@ def _embed_batch(
     return torch.cat(out, dim=0)
 
 
-def _spearman(a: list[float], b: list[float]) -> float:
-    """Spearman ρ via Pearson on ranks. Ties handled via argsort-of-argsort."""
-    at = torch.tensor(a, dtype=torch.float64)
-    bt = torch.tensor(b, dtype=torch.float64)
-    a_rank = torch.argsort(torch.argsort(at)).double()
-    b_rank = torch.argsort(torch.argsort(bt)).double()
-    a_rank -= a_rank.mean()
-    b_rank -= b_rank.mean()
-    denom = (a_rank.norm() * b_rank.norm()).item()
-    if denom == 0:
-        return 0.0
-    return float((a_rank @ b_rank).item() / denom)
-
-
 def sts_benchmark(
     extractor: ConceptExtractor,
     tokenizer: PreTrainedTokenizer,
@@ -98,7 +85,7 @@ def sts_benchmark(
     c2 = _embed_batch(extractor, tokenizer, s2, device, max_length, batch_size)
     sims = F.cosine_similarity(c1, c2, dim=-1).tolist()
 
-    return {"sts_spearman": _spearman(sims, labels), "n_pairs": float(len(labels))}
+    return {"sts_spearman": spearman_rho(sims, labels), "n_pairs": float(len(labels))}
 
 
 def linear_probe_sst2(
