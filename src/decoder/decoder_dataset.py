@@ -1,27 +1,38 @@
+import random
 from dataclasses import dataclass
 
 import torch
+import torch.utils.data
 from torch.utils.data import DataLoader, Dataset
 from transformers import PreTrainedTokenizer
-
-from src.common.config import LANGJEPAConfig
 
 
 @dataclass
 class DecoderBatch:
-    """Holds batched data for decoder training."""
+    """Batched data for decoder training."""
 
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
-    input_texts: list[str]  # Original texts for evaluation
+    input_texts: list[str]  # Original texts, kept for eval/sampling
 
 
 class DecoderDataset(Dataset):
-    """Dataset for training the concept decoder."""
+    """A thin Dataset over a list of text strings, tokenized on collate.
+
+    Keep this dataset only for texts (not context/target pairs). The decoder
+    task is: given concept(text), reconstruct text. Pass in the sentences or
+    documents you want the decoder to be able to reconstruct.
+    """
 
     def __init__(
         self, texts: list[str], tokenizer: PreTrainedTokenizer, max_length: int = 128
     ):
+        if not all(isinstance(t, str) for t in texts):
+            raise TypeError(
+                "DecoderDataset expects list[str]; got a non-string item. "
+                "If starting from TextDataset.samples, extract .target (or "
+                ".context) strings before passing."
+            )
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -29,114 +40,62 @@ class DecoderDataset(Dataset):
     def __len__(self) -> int:
         return len(self.texts)
 
-    def __getitem__(self, idx: int) -> dict[str, str]:
-        return {"text": self.texts[idx]}
+    def __getitem__(self, idx: int) -> str:
+        return self.texts[idx]
 
-    def collate_fn(self, batch: list[dict[str, str]]) -> DecoderBatch:
-        """Collate batch of texts into tensors."""
-        texts = [item["text"] for item in batch]
-
-        # Tokenize
+    def collate_fn(self, batch: list[str]) -> DecoderBatch:
         encodings = self.tokenizer(
-            texts,
+            batch,
             padding=True,
             truncation=True,
             max_length=self.max_length,
             return_tensors="pt",
         )
-
         return DecoderBatch(
             input_ids=encodings["input_ids"],
             attention_mask=encodings["attention_mask"],
-            input_texts=texts,
+            input_texts=batch,
         )
 
 
-def create_train_loader(
-    config: LANGJEPAConfig, texts: list[str] | None = None
+def make_loader(
+    texts: list[str],
+    tokenizer: PreTrainedTokenizer,
+    max_length: int,
+    batch_size: int,
+    num_workers: int,
+    shuffle: bool,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
-    """Create training data loader."""
-    # If texts not provided, load from config's dataset
-    if texts is None:
-        from src.common.datasets.fineweb_edu import TextDataset
-
-        dataset = TextDataset(
-            train_file=config.data.train_file,
-            limit=config.data.limit,
-            min_length=config.data.min_length,
+    dataset = DecoderDataset(texts, tokenizer, max_length=max_length)
+    sampler = None
+    if world_size > 1:
+        sampler = torch.utils.data.DistributedSampler(
+            dataset, num_replicas=world_size, rank=rank, shuffle=shuffle
         )
-        texts = dataset.samples
-
-    # Create decoder dataset
-    decoder_dataset = DecoderDataset(
-        texts=texts, tokenizer=config.data.tokenizer, max_length=config.model.max_length
-    )
-
-    # Create loader
+        shuffle = False
     return DataLoader(
-        decoder_dataset,
-        batch_size=config.data.batch_size,
-        shuffle=True,
-        num_workers=config.data.num_workers,
-        collate_fn=decoder_dataset.collate_fn,
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=num_workers,
+        collate_fn=dataset.collate_fn,
         pin_memory=True,
     )
 
 
-def create_eval_loader(
-    config: "LANGJEPAConfig", texts: list[str] | None = None, eval_size: int = 1000
-) -> DataLoader:
-    """Create evaluation data loader."""
-    if texts is None:
-        # Load validation split if available, otherwise use subset of training
-        try:
-            from src.common.datasets.fineweb_edu import TextDataset
-
-            eval_dataset = TextDataset(
-                train_file=config.data.train_file,
-                limit=eval_size,
-                min_length=config.data.min_length,
-                split="validation",  # Assuming this is added to TextDataset
-            )
-            texts = eval_dataset.samples
-        except:
-            # If no validation split, use subset of training data
-            from src.common.datasets.fineweb_edu import TextDataset
-
-            dataset = TextDataset(
-                train_file=config.data.train_file,
-                limit=eval_size,
-                min_length=config.data.min_length,
-            )
-            texts = dataset.samples[:eval_size]
-
-    # Create decoder dataset
-    decoder_dataset = DecoderDataset(
-        texts=texts, tokenizer=config.data.tokenizer, max_length=config.model.max_length
-    )
-
-    # Create loader without shuffling for consistent evaluation
-    return DataLoader(
-        decoder_dataset,
-        batch_size=config.data.batch_size,
-        shuffle=False,
-        num_workers=config.data.num_workers,
-        collate_fn=decoder_dataset.collate_fn,
-        pin_memory=True,
-    )
-
-
-# Utility function to split data for training and evaluation
 def split_train_eval(
-    texts: list[str], eval_ratio: float = 0.1, shuffle: bool = True, seed: int = 42
+    texts: list[str],
+    eval_ratio: float = 0.1,
+    shuffle: bool = True,
+    seed: int = 42,
 ) -> tuple[list[str], list[str]]:
-    """Split texts into training and evaluation sets."""
+    """Deterministic train/eval split by a seeded shuffle. Returns (train, eval)."""
+    texts = list(texts)
     if shuffle:
-        import random
-
-        random.seed(seed)
-        texts = texts.copy()
-        random.shuffle(texts)
-
+        rng = random.Random(seed)
+        rng.shuffle(texts)
     split_idx = int(len(texts) * (1 - eval_ratio))
     return texts[:split_idx], texts[split_idx:]

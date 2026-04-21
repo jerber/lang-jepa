@@ -1,149 +1,145 @@
-from dataclasses import dataclass
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from src.common.distributed import DistInfo, setup_distributed, unwrap
 from src.common.logging import AverageMeter
+from src.decoder.concept_extractor import ConceptExtractor
+from src.decoder.config import DecoderFullConfig
 from src.decoder.decoder_dataset import DecoderBatch
 from src.decoder.models import ConceptDecoder
-from src.decoder.utils.evaluation import ConceptMetrics, SampleGenerator
-from src.encoder.models import TextTransformer
-
-
-@dataclass
-class DecoderTrainingConfig:
-    """Configuration for decoder training."""
-
-    batch_size: int
-    learning_rate: float
-    num_epochs: int
-    warmup_steps: int
-    grad_clip: float
-    weight_decay: float
-    eval_steps: int
-    save_steps: int
-    output_dir: str
+from src.decoder.utils.evaluation import ConceptMetrics, SampleGenerator, format_metrics
 
 
 class DecoderTrainer:
+    """Trains a ConceptDecoder given a frozen ConceptExtractor.
+
+    Supports single-GPU, CPU, and DDP (detected via LOCAL_RANK). The extractor
+    is always per-rank (frozen, no gradients) and the decoder gets wrapped in
+    DDP when world_size > 1.
+    """
+
     def __init__(
         self,
-        config: DecoderTrainingConfig,
-        encoder: TextTransformer,
+        config: DecoderFullConfig,
+        extractor: ConceptExtractor,
         decoder: ConceptDecoder,
         train_loader: DataLoader,
         eval_loader: DataLoader | None = None,
-        device: torch.device | None = None,
+        dist_info: DistInfo | None = None,
     ):
         self.config = config
-        self.encoder = encoder
-        self.decoder = decoder
+        self.training = config.training
+        self.evaluation = config.evaluation
+        self.dist_info = dist_info or setup_distributed()
+        self.device = self.dist_info.device
+
+        self.extractor = extractor.to(self.device)
+        self._decoder_mod = decoder.to(self.device)
+        if self.dist_info.is_distributed and torch.cuda.is_available():
+            self.decoder: torch.nn.Module = DDP(
+                self._decoder_mod, device_ids=[self.dist_info.local_rank]
+            )
+        else:
+            self.decoder = self._decoder_mod
+
         self.train_loader = train_loader
         self.eval_loader = eval_loader
-        self.device = device or torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu"
-        )
 
-        # Move models to device
-        self.encoder = self.encoder.to(self.device)
-        self.decoder = self.decoder.to(self.device)
-
-        # Freeze encoder
-        for param in self.encoder.parameters():
-            param.requires_grad = False
-        self.encoder.eval()
-
-        # Setup optimizer
         self.optimizer = AdamW(
             self.decoder.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
+            lr=self.training.learning_rate,
+            weight_decay=self.training.weight_decay,
         )
 
-        # Setup metrics
-        self.metrics = ConceptMetrics(self.decoder.tokenizer, self.device)
+        self.metrics = ConceptMetrics(
+            self._decoder_mod.tokenizer,
+            self.device,
+            max_length=self._decoder_mod.config.max_length,
+        )
         self.sample_generator = SampleGenerator(
-            self.encoder, self.decoder, self.decoder.tokenizer, self.device
+            self.extractor,
+            self._decoder_mod,
+            self._decoder_mod.tokenizer,
+            self.device,
+            max_length=self._decoder_mod.config.max_length,
         )
 
-        # Create output directory
-        self.output_dir = Path(config.output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = Path(self.training.output_dir)
+        if self.dist_info.is_main:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _process_batch(self, batch: DecoderBatch) -> tuple[torch.Tensor, torch.Tensor]:
-        """Process a batch of data."""
-        input_ids = batch.input_ids.to(self.device)
-        attention_mask = batch.attention_mask.to(self.device)
-        return input_ids, attention_mask
+        return batch.input_ids.to(self.device), batch.attention_mask.to(self.device)
+
+    def _forward_loss(
+        self, input_ids: torch.Tensor, attention_mask: torch.Tensor
+    ) -> torch.Tensor:
+        concepts = self.extractor(input_ids, attention_mask)
+        logits = self.decoder(concepts, target_ids=input_ids)  # [B, L-1, V]
+        return F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)),
+            input_ids[:, 1:].reshape(-1),
+            ignore_index=self._decoder_mod.config.pad_token_id,
+        )
 
     def train(self) -> None:
-        """Main training loop."""
         best_loss = float("inf")
         global_step = 0
+        forward_count = 0
         loss_meter = AverageMeter()
+        accum = self.training.grad_accum_steps
 
-        for epoch in range(self.config.num_epochs):
-            print(f"\nEpoch {epoch + 1}/{self.config.num_epochs}")
+        for epoch in range(self.training.num_epochs):
+            if self.dist_info.is_main:
+                print(f"\nEpoch {epoch + 1}/{self.training.num_epochs}")
             self.decoder.train()
+            if hasattr(self.train_loader.sampler, "set_epoch"):
+                self.train_loader.sampler.set_epoch(epoch)
 
-            for batch in tqdm(self.train_loader, desc="Training"):
-                # Process batch
+            iterator = (
+                tqdm(self.train_loader, desc="Training")
+                if self.dist_info.is_main
+                else self.train_loader
+            )
+            for batch in iterator:
                 input_ids, attention_mask = self._process_batch(batch)
-
-                # Get concept embeddings from encoder
-                with torch.no_grad():
-                    concepts = self.encoder(input_ids, attention_mask)
-                    if len(concepts.shape) > 2:
-                        concepts = concepts.mean(dim=1)  # Average sequence dimension
-
-                # Forward pass through decoder
-                # input_ids[:, :-1] as input, input_ids[:, 1:] as targets
-                logits = self.decoder(concepts, target_ids=input_ids)  # [B, L-1, V]
-
-                # Prepare targets (excluding first token)
-                targets = input_ids[:, 1:].reshape(-1)  # [B*(L-1)]
-
-                # Reshape logits to match target shape
-                logits = logits.reshape(-1, logits.size(-1))  # [B*(L-1), V]
-
-                # Verify shapes match
-                assert logits.size(0) == targets.size(0), (
-                    f"Shape mismatch: logits {logits.shape}, targets {targets.shape}. "
-                    f"Batch size: {input_ids.size(0)}, Sequence length: {input_ids.size(1)}"
+                is_boundary = ((forward_count + 1) % accum) == 0
+                sync_ctx = (
+                    self.decoder.no_sync()
+                    if isinstance(self.decoder, DDP) and not is_boundary
+                    else nullcontext()
                 )
 
-                # Compute loss
-                loss = F.cross_entropy(
-                    logits,
-                    targets,
-                    ignore_index=self.decoder.config.pad_token_id,
-                )
-
-                # Update meter
+                with sync_ctx:
+                    loss = self._forward_loss(input_ids, attention_mask)
+                    (loss / accum).backward()
+                forward_count += 1
                 loss_meter.update(loss.item())
 
-                # Backward pass
-                self.optimizer.zero_grad()
-                loss.backward()
-                if self.config.grad_clip > 0:
+                if not is_boundary:
+                    continue
+
+                if self.training.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
-                        self.decoder.parameters(), self.config.grad_clip
+                        self.decoder.parameters(), self.training.grad_clip
                     )
                 self.optimizer.step()
-
-                # Increment step
+                self.optimizer.zero_grad(set_to_none=True)
                 global_step += 1
 
-                # Evaluate if needed
-                if global_step % self.config.eval_steps == 0:
+                if (
+                    self.dist_info.is_main
+                    and global_step % self.evaluation.eval_steps == 0
+                ):
                     eval_loss = self.evaluate()
                     print(f"\nStep {global_step} - Eval loss: {eval_loss:.4f}")
-
-                    # Save if best
                     if eval_loss < best_loss:
                         best_loss = eval_loss
                         self.save_checkpoint(
@@ -151,92 +147,79 @@ class DecoderTrainer:
                             global_step,
                             best_loss,
                         )
-
-                    # Generate samples
                     if self.eval_loader is not None:
                         eval_batch = next(iter(self.eval_loader))
                         samples = self.sample_generator.generate_samples(
-                            eval_batch.input_texts, num_samples=2
+                            eval_batch.input_texts,
+                            num_samples=self.evaluation.num_samples,
                         )
                         self._print_samples(samples)
+                        extended = self.metrics.compute_metrics(
+                            extractor=self.extractor,
+                            decoder=self._decoder_mod,
+                            original_texts=[s["original"] for s in samples],
+                            generated_texts=[s["generated"] for s in samples],
+                        )
+                        print("\nExtended metrics (on a sample):")
+                        print(format_metrics(extended))
 
-                # Save checkpoint if needed
-                if global_step % self.config.save_steps == 0:
+                if (
+                    self.dist_info.is_main
+                    and global_step % self.evaluation.save_steps == 0
+                ):
                     self.save_checkpoint(
                         self.output_dir / f"decoder_step_{global_step}.pt",
                         global_step,
                         loss_meter.avg,
                     )
 
-                # Log progress
-                if global_step % 10 == 0:
-                    print(f"\nStep {global_step} - Loss: {loss_meter.avg:.4f}")
+                if self.dist_info.is_main and global_step % 10 == 0:
+                    print(f"Step {global_step} - Loss: {loss_meter.avg:.4f}")
 
-            # End of epoch
-            print(f"Epoch {epoch + 1} finished. Avg loss: {loss_meter.avg:.4f}")
+            if self.dist_info.is_main:
+                print(f"Epoch {epoch + 1} finished. Avg loss: {loss_meter.avg:.4f}")
             loss_meter.reset()
 
     @torch.no_grad()
     def evaluate(self) -> float:
-        """Evaluate the decoder."""
         if self.eval_loader is None:
             return float("inf")
 
         self.decoder.eval()
-        total_loss = 0
+        total_loss = 0.0
         num_batches = 0
-
         for batch in self.eval_loader:
-            # Process batch
             input_ids, attention_mask = self._process_batch(batch)
-
-            # Get concepts
-            concepts = self.encoder(input_ids, attention_mask)
-
-            # Generate
-            logits = self.decoder(concepts, target_ids=input_ids)
-
-            # Compute loss
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                input_ids[:, 1:].reshape(-1),
-                ignore_index=self.decoder.config.pad_token_id,
-            )
-
-            total_loss += loss.item()
+            total_loss += self._forward_loss(input_ids, attention_mask).item()
             num_batches += 1
 
-        avg_loss = total_loss / num_batches
+        avg_loss = total_loss / max(num_batches, 1)
         self.decoder.train()
         return avg_loss
 
     def save_checkpoint(self, path: Path, global_step: int, loss: float) -> None:
-        """Save a checkpoint."""
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
                 "step": global_step,
-                "model_state_dict": self.decoder.state_dict(),
+                "model_state_dict": unwrap(self.decoder).state_dict(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
                 "loss": loss,
-                "config": self.decoder.config,
+                "config": self._decoder_mod.config,
             },
             path,
         )
         print(f"Saved checkpoint to {path}")
 
     def load_checkpoint(self, path: Path) -> None:
-        """Load a checkpoint."""
         if not path.exists():
             raise FileNotFoundError(f"Checkpoint not found at {path}")
-
         checkpoint = torch.load(path, map_location=self.device)
-        self.decoder.load_state_dict(checkpoint["model_state_dict"])
+        unwrap(self.decoder).load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         print(f"Loaded checkpoint from {path}")
 
     def _print_samples(self, samples: list) -> None:
-        """Print generated samples."""
         print("\nGenerated Samples:")
         print("-" * 50)
         for i, sample in enumerate(samples, 1):
