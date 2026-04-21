@@ -37,8 +37,41 @@ class MonitoringExample:
     similarity_score: float
 
 
+def _effective_rank(centered: Tensor) -> float:
+    """Effective rank = exp(entropy of normalized singular values).
+
+    Measures dimensional collapse: full rank → eff_rank = min(N, D); total
+    collapse → eff_rank = 1. Works on centered [N, D] batches.
+    """
+    if centered.numel() == 0 or centered.shape[0] < 2:
+        return 0.0
+    # Float32 for stable SVD, even if the batch is bf16.
+    svals = torch.linalg.svdvals(centered.float())
+    svals = svals[svals > 1e-10]
+    if svals.numel() == 0:
+        return 0.0
+    p = svals / svals.sum()
+    entropy = -(p * p.log()).sum()
+    return float(entropy.exp().item())
+
+
+def _off_diag_cov_l1(centered: Tensor) -> float:
+    """Sum of abs off-diagonal entries of (centered^T @ centered) / N."""
+    n = centered.shape[0]
+    if n < 2:
+        return 0.0
+    cov = (centered.float().T @ centered.float()) / (n - 1)
+    off = cov - torch.diag(torch.diag(cov))
+    return float(off.abs().sum().item())
+
+
 class ValidationMetrics:
-    """Tracks validation metrics for JEPA model evaluation."""
+    """Tracks validation metrics for JEPA model evaluation.
+
+    Includes anti-collapse diagnostics on the target batch: per-dim stddev,
+    effective rank, and off-diagonal covariance L1. Healthy training keeps
+    stddev above ~0.1, eff_rank comfortably > 1, and covariance bounded.
+    """
 
     def __init__(self):
         self.reset()
@@ -51,6 +84,9 @@ class ValidationMetrics:
             "semantic/hit_rate": 0.0,
             "embeddings/norm": 0.0,
             "embeddings/diversity": 0.0,
+            "embeddings/target_std_mean": 0.0,
+            "embeddings/target_eff_rank": 0.0,
+            "embeddings/target_off_diag_cov_l1": 0.0,
         }
 
     def update(self, pred_embeddings: Tensor, target_embeddings: Tensor):
@@ -76,6 +112,13 @@ class ValidationMetrics:
         mask = ~torch.eye(batch_size, dtype=torch.bool, device=pred_embeddings.device)
         diversity = 1 - cosine_sim_matrix[mask].mean().item()
 
+        # Anti-collapse diagnostics computed on the target batch
+        with torch.no_grad():
+            centered = target_embeddings - target_embeddings.mean(dim=0, keepdim=True)
+            target_std_mean = float(target_embeddings.std(dim=0).mean().item())
+            target_eff_rank = _effective_rank(centered)
+            off_diag_l1 = _off_diag_cov_l1(centered)
+
         # Update running averages
         weight = batch_size / (self.total_samples + batch_size)
         old_weight = 1 - weight
@@ -91,6 +134,18 @@ class ValidationMetrics:
         )
         self.metrics["embeddings/diversity"] = (
             old_weight * self.metrics["embeddings/diversity"] + weight * diversity
+        )
+        self.metrics["embeddings/target_std_mean"] = (
+            old_weight * self.metrics["embeddings/target_std_mean"]
+            + weight * target_std_mean
+        )
+        self.metrics["embeddings/target_eff_rank"] = (
+            old_weight * self.metrics["embeddings/target_eff_rank"]
+            + weight * target_eff_rank
+        )
+        self.metrics["embeddings/target_off_diag_cov_l1"] = (
+            old_weight * self.metrics["embeddings/target_off_diag_cov_l1"]
+            + weight * off_diag_l1
         )
 
         self.total_samples += batch_size

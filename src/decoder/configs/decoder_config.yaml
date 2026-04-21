@@ -1,5 +1,5 @@
 decoder:
-  hidden_dim: 1536  # 2x the base model embed_dim
+  hidden_dim: 1536      # 2x the encoder embed_dim
   num_layers: 4
   num_heads: 8
   dropout: 0.1
@@ -7,13 +7,15 @@ decoder:
 
 training:
   batch_size: 32
-  learning_rate: 1e-4
+  learning_rate: 0.0001
   num_epochs: 10
-  warmup_steps: 1000
   weight_decay: 0.01
-  gradient_clip: 1.0
+  grad_clip: 1.0
+  grad_accum_steps: 1
+  eval_ratio: 0.1
+  output_dir: "outputs/decoder"
 
 evaluation:
   eval_steps: 100
   save_steps: 1000
-  num_samples: 5  # Number of samples to show during evaluation
+  num_samples: 5

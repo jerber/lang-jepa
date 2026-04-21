@@ -1,44 +1,52 @@
 data:
   # Dataset configuration
-  train_file: "sample-10BT"  # FineWeb-Edu dataset file
+  train_file: "sample-10BT"       # FineWeb-Edu dataset slice
   batch_size: 32
   num_workers: 4
-  tokenizer_path: "roberta-base"  # Base tokenizer to use
-#  tokenizer_path: "bert-base-uncased"
-#  tokenizer_path: "gpt2"
-  limit: 100  # Number of training samples to use
-  min_length: 100  # Minimum text length to consider
-  min_sentences: 2  # Minimum number of sentences (needed for context/target split)
+  tokenizer_path: "roberta-base"  # Base tokenizer. Also the base weights if pretrained=true.
+# tokenizer_path: "bert-base-uncased"
+# tokenizer_path: "gpt2"
+  limit: 10000                    # Docs to stream. Laptop users: dial down (e.g. 200).
+  min_length: 100                 # Minimum text length in chars
+  min_sentences: 2                # Need >=2 sentences to form a context/target pair
+  window_size: 8                  # Context = previous N sentences
+  val_fraction: 0.0               # Hash-based held-out val fraction (per document)
+  streaming: false                # True for cluster-scale runs; must set max_steps
+  shuffle_buffer: 10000           # Streaming shuffle buffer size
+  splitter_device: "cpu"          # Keep sentence splitter off the training GPU
 
 model:
-  max_length: 128  # Should be smaller, around 128-256
-  pred_dim: 384
-  embed_dim: 768   # Standard size for base models
+  max_length: 512                 # RoBERTa-base's limit; enough to fit ~8-sentence context
+  pred_dim: 768                   # Match embed_dim: no target-side projection (I-JEPA style)
+  embed_dim: 768                  # RoBERTa-base hidden size
   num_layers: 12
   num_heads: 12
   mlp_ratio: 4.0
   dropout: 0.1
+  pretrained: true                # Start from AutoModel.from_pretrained(tokenizer_path)
 
 optimization:
-  # Training parameters
   epochs: 5
-  lr: 0.001              # Peak learning rate
-  warmup: 1              # Warmup epochs
-  weight_decay: 0.04     # Initial weight decay
-  final_weight_decay: 0.4  # Final weight decay
-  final_lr: 0.000001     # Final learning rate after decay
+  lr: 0.0001                      # Lowered for 124M transformer (was 1e-3, too aggressive)
+  warmup: 2                       # Warmup epochs
+  weight_decay: 0.04
+  final_weight_decay: 0.4
+  final_lr: 0.000001
+  loss_fn: "smooth_l1"            # "smooth_l1" on normalized features, or "cosine"
+  momentum_start: 0.996           # EMA target encoder momentum (I-JEPA default)
+  momentum_end: 1.0
+  grad_accum_steps: 1             # Effective batch = batch_size * accum * world_size
+  max_steps: null                 # Required when data.streaming=true
 
 logging:
-  # Logging configuration
-  log_dir: "logs/lang_jepa"  # Directory for saving logs and checkpoints
-  log_freq: 50               # How often to log training metrics (iterations)
-  checkpoint_freq: 1         # How often to save checkpoints (epochs)
-  num_examples: 3            # Number of examples to monitor during training
-  log_to_wandb: true        # Whether to log to Weights & Biases
+  log_dir: "logs/lang_jepa"
+  log_freq: 50
+  checkpoint_freq: 1
+  num_examples: 3
+  log_to_wandb: false             # Flip to true if WANDB_API_KEY is set
 
 meta:
-  # Mixed precision and checkpointing
-  use_bfloat16: false                 # Whether to use bfloat16 mixed precision
-  load_checkpoint: false              # Whether to load from checkpoint
-  checkpoint_path: null               # Path to checkpoint if loading
+  use_bfloat16: false
+  load_checkpoint: false
+  checkpoint_path: null
   use_gradient_checkpointing: false
